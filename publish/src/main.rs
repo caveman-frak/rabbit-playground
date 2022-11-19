@@ -2,11 +2,14 @@ use {
     clap::Parser,
     dotenv::dotenv,
     lapin::{
-        options::BasicPublishOptions, BasicProperties, Connection, ConnectionProperties, Result,
+        options::{BasicPublishOptions, ConfirmSelectOptions},
+        types::{AMQPValue, FieldTable},
+        BasicProperties, Connection, ConnectionProperties, Result,
     },
     requestty::{prompt_one, Answer, Question},
+    std::iter::Iterator,
     tokio::runtime::Builder,
-    tracing::{debug, info},
+    tracing::{debug, info, warn},
 };
 
 #[derive(Parser, Debug)]
@@ -26,6 +29,46 @@ struct Cli {
     /// The routing key to use
     #[arg(name = "routing-key", long, short, env = "PUB_ROUTING")]
     routing_key: Option<String>,
+    /// Optional message headers to send (format "key1=value1,key2=value2...")
+    #[arg(
+        name = "headers",
+        long,
+        short = 'p',
+        value_delimiter = ',',
+        env = "PUB_HEADERS"
+    )]
+    headers: Option<Vec<String>>,
+}
+
+impl Cli {
+    pub fn url(&self) -> String {
+        self.url.to_owned()
+    }
+
+    pub fn exchange(&self) -> String {
+        self.exchange.to_owned()
+    }
+
+    pub fn routing_key(&self) -> String {
+        self.routing_key.to_owned().unwrap_or_default()
+    }
+
+    pub fn headers(&self) -> Option<FieldTable> {
+        match self.headers.as_ref() {
+            Some(headers) => Some(headers.iter().fold(FieldTable::default(), |mut ft, s| {
+                let mut parts = s.split('=');
+                match (parts.next(), parts.next()) {
+                    (Some(key), Some(value)) => {
+                        debug!("Adding header {} = {}", key, value);
+                        ft.insert(key.into(), AMQPValue::LongString(value.into()))
+                    }
+                    _ => warn!("Ignoring unparsable header value '{}'!", s),
+                };
+                ft
+            })),
+            None => None,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -44,9 +87,14 @@ fn main() -> Result<()> {
 
     info!("Starting up");
 
-    let addr = cli.url;
-    let exchange = cli.exchange;
-    let routing_key = cli.routing_key.unwrap_or_default();
+    let addr = cli.url();
+    let exchange = cli.exchange();
+    let routing_key = cli.routing_key();
+    let properties = match cli.headers() {
+        Some(headers) => BasicProperties::default().with_headers(headers),
+        None => BasicProperties::default(),
+    };
+
     info!("Connecting to {} {} ...", addr, exchange);
 
     // create connector to rabbitmq server
@@ -54,7 +102,7 @@ fn main() -> Result<()> {
     let connection = runtime.block_on(async {
         let connection = Connection::connect(&addr, options)
             .await
-            .expect("connection error");
+            .expect("Create connection failure!");
         debug!(target="connection", state=?connection.status().state());
         connection
     });
@@ -64,8 +112,16 @@ fn main() -> Result<()> {
         let channel = connection
             .create_channel()
             .await
-            .expect("create_channel: send");
+            .expect("Create channel failure!");
         debug!(target="channel", state=?channel.status().state());
+
+        // set channel to publisher-confirms
+        channel
+            .confirm_select(ConfirmSelectOptions::default())
+            .await
+            .expect("Confirm select failure!");
+        debug!(target="channel", state=?channel.status().state());
+
         channel
     });
 
@@ -79,26 +135,54 @@ fn main() -> Result<()> {
     )
     .unwrap_or(Answer::Bool(false))
     .as_bool()
-    .expect("Question::confirm returns a bool")
+    .expect("Question::confirm failed to return a bool!")
     {
         counter += 1;
-        info!("Sending Message {} ...", counter);
-        let _confirm = runtime.block_on(async {
+        debug!("Sending Message {} ...", counter);
+
+        let confirmed = runtime.block_on(async {
             let payload = format!("Hello person #{:02}!", counter);
             info!("> {}", payload);
 
-            channel
+            let confirm = channel
                 .basic_publish(
                     &exchange,
                     &routing_key,
-                    BasicPublishOptions::default(),
+                    BasicPublishOptions {
+                        mandatory: true,
+                        ..BasicPublishOptions::default()
+                    },
                     payload.as_bytes(),
-                    BasicProperties::default(),
+                    // BasicProperties::default(),
+                    properties.to_owned(),
                 )
-                .await?
                 .await
+                .expect("Basic Publish failure!")
+                .await
+                .expect("Published Confirm failure!");
+
+            if confirm.is_ack() {
+                if let Some(message) = confirm.take_message() {
+                    warn!(
+                        "Messaage rejected with {} {}",
+                        message.reply_code, message.reply_text
+                    );
+                } else {
+                    debug!("Message accepted");
+                    return true;
+                }
+            } else if confirm.is_nack() {
+                warn!("Message not acknowled!")
+            } else {
+                warn!("Unknown message state!")
+            }
+            false
         });
-        info!("message sent!");
+        if confirmed {
+            debug!("Message sent");
+        } else {
+            warn!("message send failed!")
+        }
     }
     info!("Finishing off and cleaning up");
 

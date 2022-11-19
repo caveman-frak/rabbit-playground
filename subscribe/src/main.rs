@@ -1,15 +1,16 @@
 use {
     clap::Parser,
     dotenv::dotenv,
+    joinery::JoinableIterator,
     lapin::{
         message::DeliveryResult,
         options::{BasicAckOptions, BasicConsumeOptions},
-        types::FieldTable,
+        types::{FieldTable, LongString},
         Connection, ConnectionProperties, Result,
     },
     std::str,
     tokio::signal,
-    tracing::{debug, info},
+    tracing::{debug, error, info, warn},
 };
 
 #[derive(Parser, Debug)]
@@ -52,13 +53,13 @@ async fn main() -> Result<()> {
 
     let connection = Connection::connect(addr, options)
         .await
-        .expect("connection error");
+        .expect("Create connection failure!");
     debug!(target="connection", state=?connection.status().state());
 
     let channel = connection
         .create_channel()
         .await
-        .expect("create_channel: send");
+        .expect("Create channel failure!");
     debug!(target="channel", state=?channel.status().state());
 
     info!("Connected to server!");
@@ -83,22 +84,35 @@ async fn main() -> Result<()> {
             }
             // Carries the error and is always followed by Ok(None)
             Err(error) => {
-                debug!("Failed to consume queue message {}", error);
+                warn!("Failed to consume queue message {}", error);
                 return;
             }
         };
 
-        let data = &delivery.data[..];
         info!(
-            "Received {} :: {}",
-            delivery.routing_key,
-            str::from_utf8(data).unwrap()
+            "Received {} :: {:?}\n{}\n",
+            &delivery.routing_key,
+            match &delivery.properties.headers().as_ref() {
+                Some(headers) => headers
+                    .into_iter()
+                    .map(|(k, v)| {
+                        format!(
+                            "{}={}",
+                            k,
+                            v.as_long_string().unwrap_or(&LongString::from(""))
+                        )
+                    })
+                    .join_with(", ")
+                    .to_string(),
+                None => String::from(""),
+            },
+            str::from_utf8(&delivery.data[..]).unwrap()
         );
 
         delivery
             .ack(BasicAckOptions::default())
             .await
-            .expect("Failed to ack send_webhook_event message");
+            .expect("Message acknowledgement failed!");
     });
     info!("Listening for messages");
 
@@ -108,8 +122,7 @@ async fn main() -> Result<()> {
             connection.close(0, "OK").await?;
         }
         Err(err) => {
-            eprintln!("Unable to listen for shutdown signal: {}", err);
-            // we also shut down in case of error
+            error!("Unable to listen for shutdown signal: {}", err);
         }
     }
     info!("Shutting Down");
