@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
         };
 
         info!(
-            "Received {} :: {:?}\n{}\n",
+            "\nReceived {} :: {:?}\n{}",
             &delivery.routing_key,
             match &delivery.properties.headers().as_ref() {
                 Some(headers) => headers
